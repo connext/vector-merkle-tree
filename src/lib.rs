@@ -1,7 +1,7 @@
-use std::cell::RefCell;
-
 use faster_hex::hex_decode;
+use firestorm::{profile_method, profile_section};
 use format::hex_encode;
+use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
 
 thread_local! {
@@ -33,14 +33,19 @@ pub(crate) struct Node {
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
 pub struct Tree {
-    leaves: Vec<Node>,
+    // TODO: Re-create soa_vec
+    hashes: Vec<Bytes32>,
+    transfer_ids: Vec<Bytes32>,
 }
 
 #[wasm_bindgen]
 impl Tree {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self { leaves: Vec::new() }
+        Self {
+            hashes: Vec::new(),
+            transfer_ids: Vec::new(),
+        }
     }
 
     #[wasm_bindgen(js_name = insertHex)]
@@ -72,20 +77,21 @@ impl Tree {
 
 impl Tree {
     fn insert_node(&mut self, node: Node) -> Result<(), Error> {
-        match self
-            .leaves
-            .binary_search_by_key(&&node.transfer_id, |n| &n.transfer_id)
-        {
+        profile_method!(insert_node);
+
+        let Node { transfer_id, hash } = node;
+        match self.transfer_ids.binary_search(&transfer_id) {
             // This structure cannot handle a duplicate transfer ID because there
             // would not be one canonical ordering. But, if the transfer already
             // exists it can treat this idempotently.
             Ok(i) => {
-                if node.hash != self.leaves[i].hash {
+                if unsafe { self.hashes.get_unchecked(i) } != &hash {
                     return Err(Error::DuplicateTransferID);
                 }
             }
             Err(i) => {
-                self.leaves.insert(i, node);
+                self.transfer_ids.insert(i, transfer_id);
+                self.hashes.insert(i, hash);
             }
         };
         Ok(())
@@ -93,17 +99,19 @@ impl Tree {
 
     /// Insert a leaf with the given transfer state.
     pub fn insert_hex(&mut self, core_transfer_state: &str) -> Result<(), Error> {
+        profile_method!(insert_hex);
+
         let node = format::hex_to_node(core_transfer_state)?;
         self.insert_node(node)
     }
 
     /// Remove the leaf corresponding to the transfer with a given id.
     pub fn delete_id(&mut self, transfer_id: Bytes32) {
-        if let Ok(i) = self
-            .leaves
-            .binary_search_by_key(&&transfer_id, |n| &n.transfer_id)
-        {
-            self.leaves.remove(i);
+        profile_method!(delete_id);
+
+        if let Ok(i) = self.transfer_ids.binary_search(&transfer_id) {
+            self.transfer_ids.remove(i);
+            self.hashes.remove(i);
         }
     }
 
@@ -112,42 +120,55 @@ impl Tree {
     /// update, fail, and finally need to roll back. To roll back the best thing to
     /// do is just to delete without calculating the root.
     pub fn root(&self) -> Bytes32 {
-        if self.leaves.len() == 0 {
+        profile_method!(root);
+
+        if self.hashes.len() == 0 {
             return Default::default();
         }
 
         SCRATCH.with(|scratch| {
             let mut scratch = scratch.borrow_mut();
+            scratch.truncate(0);
 
-            while scratch.len() < self.leaves.len() {
-                scratch.push(Default::default())
+            {
+                profile_section!(unnecessary_copy);
+                scratch.extend_from_slice(&self.hashes);
             }
 
-            let mut scratch = &mut scratch[..self.leaves.len()];
+            // (Performance) This is one of those rare cases where the
+            // borrow checker is getting in the way of performance. What we want
+            // is for on the first iteration to read from &self.hashes and write
+            // to scratch. Then on further iterations to read and write using
+            // scratch. Separating read/write in this way though would lead to
+            // aliasing problems. Doing this would remove the need for the copy
+            // (above) and reduce the size of the scratch by half.
+            // Profiling has demonstrated that this takes a negligable amount
+            // of time, so this is not urgent.
 
-            for i in 0..scratch.len() {
-                scratch[i] = self.leaves[i].hash;
-            }
+            unsafe {
+                let mut scratch = scratch.get_unchecked_mut(..);
 
-            while scratch.len() > 1 {
-                let mut write = 0;
-                let mut read = 0;
-                while read + 1 < scratch.len() {
-                    let a = scratch[read];
-                    let b = scratch[read + 1];
-                    read += 2;
-                    scratch[write] = hash::combine(&a, &b);
-                    write += 1;
+                while scratch.len() > 1 {
+                    let mut write = 0;
+                    let mut read = 0;
+                    let end = scratch.len() - 1;
+                    while read < end {
+                        let a = scratch.get_unchecked(read);
+                        let b = scratch.get_unchecked(read + 1);
+                        *scratch.get_unchecked_mut(write) = hash::combine(a, b);
+                        read += 2;
+                        write += 1;
+                    }
+                    if read < scratch.len() {
+                        *scratch.get_unchecked_mut(write) = *scratch.get_unchecked(read);
+                        write += 1;
+                    }
+
+                    scratch = scratch.get_unchecked_mut(0..write);
                 }
-                if read < scratch.len() {
-                    scratch[write] = scratch[read];
-                    write += 1;
-                }
 
-                scratch = &mut scratch[0..write];
+                *scratch.get_unchecked(0)
             }
-
-            scratch[0]
         })
     }
 }
@@ -156,13 +177,22 @@ impl Tree {
 mod tests {
     use super::*;
 
+    use firestorm::profile_fn;
     use format::hex_to_node;
     use std::time::Instant;
     use test_utils::*;
 
     #[test]
     #[ignore]
+    fn benchmark() {
+        firestorm::bench("./firestorm", speed).unwrap();
+    }
+
+    #[test]
+    #[ignore]
     fn speed() {
+        profile_fn!(speed);
+
         let start = Instant::now();
         let mut tree = Tree::new();
         let mut break_optimizer = [0u8; 32];
